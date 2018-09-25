@@ -136,6 +136,8 @@ class PythonEncoder:
             if(isinstance(obj, tf.DType)):
 
                 return type(obj).__repr__(obj)
+            elif(isinstance(obj, tf.Tensor)):
+                return {"thing":"TensorPointer"}
             else:
                 raise ValueError('Unhandled type', type(obj))
 

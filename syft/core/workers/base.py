@@ -615,9 +615,17 @@ class BaseWorker(ABC):
         if not is_torch_tensor:
             if hasattr(obj, 'id'):
                 self.rm_obj(obj.id)
-                del obj.id
+                try:
+                    # in TensorFlow this is not possible, so we add a try/catch
+                    del obj.id
+                except:
+                    ""
             if hasattr(obj, 'owner'):
-                del obj.owner
+                try:
+                    # in TensorFlow this is not possible, so we add a try/catch
+                    del obj.owner
+                except:
+                    ""
 
         if hasattr(obj, 'child'):
             if obj.child is not None:
@@ -704,7 +712,11 @@ class BaseWorker(ABC):
         else:
             logging.warning("Registering a pointer on non-owned syftTensor.")
             pointer = obj.create_pointer()
-            pointer.owner = self
+            if(pointer.owner.id != self.id):
+                try: # sometimes we can't do this - i.e. Tensorflow
+                    pointer.owner = self
+                except:
+                    ""
             self.set_obj(pointer.id, pointer)
 
         # DO NOT DELETE THIS TRY/CATCH UNLESS YOU KNOW WHAT YOU'RE DOING
@@ -800,6 +812,15 @@ class BaseWorker(ABC):
                         new_args.append(arg)
 
                 result = tf.placeholder(*new_args, **kwargs)
+
+        if(result.owner != self or result.id not in self._objects):
+
+            # VirtualWorkers frequently accidently register on localworker
+            if(hasattr(sy, 'local_worker')):
+                sy.local_worker.de_register_object(result)
+
+            result.owner.de_register_object(result)
+            self.register_object(result)
 
 
 
