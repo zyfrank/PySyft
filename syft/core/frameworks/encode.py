@@ -126,8 +126,18 @@ class PythonEncoder:
         elif isinstance(obj, (sy.SocketWorker, sy.VirtualWorker)):
             return {'__worker__': obj.id}
         # Else log the error
+
+
         else:
-            raise ValueError('Unhandled type', type(obj))
+            import tensorflow as tf
+            # Tensorflow Types (put these last since performance doesn't
+            # matter - they'll only be used during the setup of a model
+            # (not during runtime)
+            if(isinstance(obj, tf.DType)):
+
+                return type(obj).__repr__(obj)
+            else:
+                raise ValueError('Unhandled type', type(obj))
 
 
 def decode(message, worker, acquire=None, message_is_dict=False):

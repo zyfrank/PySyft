@@ -334,6 +334,10 @@ class BaseWorker(ABC):
             self.register(result)
             return result, True  # Result is private
 
+        elif message_wrapper['type'] == 'tf_cmd':
+            result = self.process_tf_command(message)
+            return result, True
+
         # A composite command. Must be unrolled
         elif message_wrapper['type'] == 'composite':
             raise NotImplementedError('Composite command not handled at the moment')
@@ -717,6 +721,117 @@ class BaseWorker(ABC):
         #    obj.data_backup = obj.data
         # except:
         #    ""
+
+    def process_tf_command(self, command_msg):
+        """process_command(self, command_msg) -> (command output, list of owners)
+        Process a command message from a client worker. Returns the
+        result of the computation and a list of the result's owners.
+
+        :Parameters:
+
+        * **command_msg (dict)** The dictionary containing a
+          command from another worker.
+
+        * **out (command output, list of** :class:`BaseWorker`
+          ids/objects **)** This executes the command
+          and returns its output along with a list of
+          the owners of the tensors involved.
+        """
+
+        # torch_utils.assert_has_only_torch_tensorvars(command_msg)
+
+        attr = command_msg['command']
+        has_self = command_msg['has_self']
+        args = command_msg['args']
+        kwargs = command_msg['kwargs']
+        self_ = command_msg['self'] if has_self else None
+
+        return self._execute_tf_call(attr, self_, *args, **kwargs)
+
+    def _execute_tf_call(self, attr, self_, *args, **kwargs):
+        """
+        Transmit the call to the appropriate TensorType for handling
+        """
+
+        # Distinguish between a command with torch tensors (like when called by the client,
+        # or received from another worker), and a command with syft tensor, which can occur
+        # when a function is overloaded by a SyftTensor (for instance _PlusIsMinusTensor
+        # overloads add and replace it by sub)
+        # try:
+        #     torch_utils.assert_has_only_torch_tensorvars((args, kwargs))
+        #     is_torch_command = True
+        # except AssertionError:
+        is_torch_command = False
+
+        has_self = self_ is not None
+
+        # if has_self:
+        #     command = torch._command_guard(attr, torch.tensorvar_methods)
+        # else:
+        #     command = torch._command_guard(attr, torch.torch_modules)
+        command = attr
+
+        raw_command = {
+            'command': command,
+            'has_self': has_self,
+            'args': args,
+            'kwargs': kwargs
+        }
+        if has_self:
+            raw_command['self'] = self_
+
+        print("processing tf call")
+        print(raw_command)
+
+        if not has_self:
+            print("process tf.function")
+
+            if(attr == 'placeholder'):
+                import tensorflow as tf
+
+                tf_guard = {}
+                tf_guard['tf.float32'] = tf.float32
+
+                new_args = list()
+                for arg in args:
+                    if arg in tf_guard:
+                        new_args.append(tf_guard[arg])
+                    else:
+                        new_args.append(arg)
+
+                result = tf.placeholder(*new_args, **kwargs)
+
+
+
+        # if is_torch_command:
+        #     # Unwrap the torch wrapper
+        #     syft_command, child_type = torch_utils.prepare_child_command(
+        #         raw_command, replace_tensorvar_with_child=True)
+        # else:
+        #     # Get the next syft class
+        #     # The actual syft class is the one which redirected (see the  _PlusIsMinus ex.)
+        #     syft_command, child_type = torch_utils.prepare_child_command(
+        #         raw_command, replace_tensorvar_with_child=True)
+        #
+        #     torch_utils.assert_has_only_syft_tensors(syft_command)
+
+        # Note: because we have pb of registration of tensors with the right worker,
+        # and because having Virtual workers creates even more ambiguity, we specify the worker
+        # performing the operation
+        # torch_utils.enforce_owner(raw_command, self)
+        #
+        # result = sy.array.handle_call(raw_command, owner=self)
+        #
+        # torch_utils.enforce_owner(result, self)
+        #
+        # if is_torch_command:
+        #     # Wrap the result
+        #     if has_self and utils.is_in_place_method(attr):
+        #         result = torch_utils.wrap_command_with(result, raw_command['self'])
+        #     else:
+        #         result = torch_utils.wrap_command(result)
+
+        return result
 
     def process_numpy_command(self, command_msg):
         """process_command(self, command_msg) -> (command output, list of owners)
