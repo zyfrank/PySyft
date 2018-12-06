@@ -49,7 +49,3 @@ class TorchTensor:
             )
 
         return ptr
-
-    def reshape(self, *args, **kwargs):
-        print("Overloading torch.Tensor.reshape")
-        return getattr(self, "native_reshape")(*args, **kwargs)
