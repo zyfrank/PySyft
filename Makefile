@@ -14,12 +14,12 @@ notebook: venv
 		python -m ipykernel install --user --name=pysyft; \
 		jupyter notebook;\
 	)
-
 .PHONY: test
 test: venv
 	(. venv/bin/activate; \
 		python setup.py install; \
-		python setup.py test;\
+		venv/bin/coverage run setup.py test;\
+		venv/bin/coverage report --fail-under 100;\
 	)
 
 docs: venv
