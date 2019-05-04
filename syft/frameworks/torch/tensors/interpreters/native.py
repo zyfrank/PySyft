@@ -1,4 +1,3 @@
-import random
 import weakref
 import torch
 
@@ -110,7 +109,7 @@ class TorchTensor(AbstractTensor):
 
             big_repr = False
 
-            if self.tags is not None:
+            if self.tags is not None and len(self.tags):
                 big_repr = True
                 out += "\n\tTags: "
                 for tag in self.tags:
@@ -125,6 +124,9 @@ class TorchTensor(AbstractTensor):
 
             return out
 
+    def __eq__(self, other):
+        return self.eq(other)
+
     @property
     def id(self):
         if self.is_wrapper:
@@ -133,7 +135,7 @@ class TorchTensor(AbstractTensor):
             try:
                 return self._id
             except:
-                self._id = int(10e10 * random.random())
+                self._id = sy.ID_PROVIDER.pop()
                 return self._id
 
     @id.setter
@@ -148,6 +150,9 @@ class TorchTensor(AbstractTensor):
         Utility method to test if the tensor is in fact a Parameter
         """
         return isinstance(self, syft.hook.torch.nn.Parameter)
+
+    def copy(self):
+        return self + 0
 
     @classmethod
     def handle_func_command(cls, command):
@@ -397,7 +402,7 @@ class TorchTensor(AbstractTensor):
             if location.id != self.owner.id:
                 ptr_id = self.id
             else:
-                ptr_id = int(10e10 * random.random())
+                ptr_id = sy.ID_PROVIDER.pop()
 
         if shape is None:
             shape = self.shape
@@ -407,7 +412,6 @@ class TorchTensor(AbstractTensor):
 
         if previous_pointer is None:
             ptr = PointerTensor(
-                parent=self,
                 location=location,
                 id_at_location=id_at_location,
                 owner=owner,
@@ -425,7 +429,6 @@ class TorchTensor(AbstractTensor):
 
         child_id = self.child.id
         tensor = self.child.get()
-        del self.owner._objects[tensor.id]
         self.owner._objects[child_id] = tensor
 
     def remote_get(self):
@@ -442,10 +445,12 @@ class TorchTensor(AbstractTensor):
 
     def get(self, *args, inplace: bool = False, **kwargs):
         """Requests the tensor/chain being pointed to, be serialized and return
-            args:
+            Args:
                 args: args to forward to worker
                 inplace: if true, return the same object instance, else a new wrapper
                 kwargs: kwargs to forward to worker
+            Raises:
+                GetNotPermittedError: Raised if get is not permitted on this tensor
         """
         # Transfer the get() to the child attribute which is a pointer
 
@@ -490,6 +495,12 @@ class TorchTensor(AbstractTensor):
         Calls get() with inplace option set to True
         """
         return self.get(*args, inplace=True, **kwargs)
+
+    def allowed_to_get(self) -> bool:
+        """This function returns true always currently. Will return false in the future
+        if get is not allowed to be called on this tensor
+        """
+        return True
 
     def move(self, location):
         ptr = self.send(location)
@@ -550,10 +561,12 @@ class TorchTensor(AbstractTensor):
     fix_precision_ = fix_prec_
 
     def share(self, *owners, field=None, crypto_provider=None):
-        """This is a passthrough method which calls .share on the child.
+        """This is a pass through method which calls .share on the child.
 
         Args:
-            owners: a list of BaseWorker objects determining who to send shares to.
+            owners (list): a list of BaseWorker objects determining who to send shares to
+            field (int or None): the arithmetic field where live the shares
+            crypto_provider (BaseWorker or None): the worker providing the crypto primitives
         """
 
         if self.has_child():
@@ -562,12 +575,20 @@ class TorchTensor(AbstractTensor):
 
         return (
             syft.frameworks.torch.tensors.interpreters.AdditiveSharingTensor(
-                field=field, crypto_provider=crypto_provider
+                field=field, crypto_provider=crypto_provider, owner=self.owner
             )
             .on(self)
             .child.init_shares(*owners)
             .wrap()
         )
+
+    def share_(self, *args, **kwargs):
+        """
+        Allows to call .share() as an inplace operation
+        """
+        tensor = self.share(*args, **kwargs)
+        self.child = tensor.child
+        return self
 
     def combine(self, *pointers):
         """This method will combine the child pointer with another list of pointers
@@ -575,7 +596,7 @@ class TorchTensor(AbstractTensor):
         Args:
             *pointers a list of pointers to be combined into a MultiPointerTensor
 
-            """
+        """
 
         assert isinstance(self.child, PointerTensor)
 

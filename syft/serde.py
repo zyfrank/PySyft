@@ -25,7 +25,11 @@ are the types and values are the simplification logic. For example,
 simplifiers[tuple] will return the function which knows how to simplify the
 tuple type. The same is true for all other simplifier/detailer functions.
 
+By default, the simplification/detail operations expect Torch tensors. If the setup requires other
+serialization process, it can override the functions _serialize_tensor and _deserialize_tensor
+
 By default, we serialize using msgpack and compress using lz4.
+If different compressions are required, the worker can override the function _apply_compress_scheme
 """
 from tempfile import TemporaryFile
 from typing import Collection
@@ -46,25 +50,34 @@ import syft
 import syft as sy
 
 from syft.workers import AbstractWorker
-from syft.workers import Plan
-from syft.workers import PlanPointer
+from syft.workers import VirtualWorker
+
+from syft.federated import Plan
 
 from syft.exceptions import CompressionNotFoundException
+from syft.exceptions import GetNotPermittedError
 
 from syft.frameworks.torch.tensors.decorators import LoggingTensor
+from syft.frameworks.torch.tensors.interpreters import AdditiveSharingTensor
+from syft.frameworks.torch.tensors.interpreters import MultiPointerTensor
 from syft.frameworks.torch.tensors.interpreters import PointerTensor
 from syft.frameworks.torch.tensors.interpreters.abstract import initialize_tensor
 
-# COMPRESSION SCHEME INT CODES
-LZ4 = 0
-ZSTD = 1
 
-# Indicator on binary header that compression was not used.
-UNUSED_COMPRESSION_INDICATOR = 48
+# COMPRESSION SCHEME INT CODES
+NO_COMPRESSION = 40
+LZ4 = 41
+ZSTD = 42
 
 
 # High Level Public Functions (these are the ones you use)
-def serialize(obj: object, compress=True, compress_scheme=LZ4, simplified=False) -> bin:
+def serialize(
+    obj: object,
+    simplified: bool = False,
+    force_no_compression: bool = False,
+    force_no_serialization: bool = False,
+    force_full_simplification: bool = False,
+) -> bin:
     """This method can serialize any object PySyft needs to send or store.
 
     This is the high level function for serializing any object or collection
@@ -73,13 +86,23 @@ def serialize(obj: object, compress=True, compress_scheme=LZ4, simplified=False)
 
     Args:
         obj (object): the object to be serialized
-        compress (bool): whether or not to compress the object
-        compress_scheme (int): the integer code specifying which compression
-            scheme to use (see above this method for scheme codes) if
-            compress == True.
         simplified (bool): in some cases we want to pass in data which has
             already been simplified - in which case we must skip double
             simplification - which would be bad.... so bad... so... so bad
+        force_no_compression (bool): If true, this will override ANY module
+            settings and not compress the objects being serialized. The primary
+            expected use of this functionality is testing and/or experimentation.
+        force_no_serialization (bool): Primarily a testing tool, this will force
+            this method to return human-readable Python objects which is very useful
+            for testing and debugging (forceably overrides module compression,
+            serialization, and the 'force_no_compression' override)). In other words,
+            only simplification operations are performed.
+        force_full_simplification (bool): Some objects are only partially serialized
+            by default. For objects where this is the case, setting this flag to True
+            will force the entire object to be serialized. For example, setting this
+            flag to True will cause a VirtualWorker to be serialized WITH all of its
+            tensors while by default VirtualWorker objects only serialize a small
+            amount of metadata.
 
     Returns:
         binary: the serialized form of the object.
@@ -90,13 +113,19 @@ def serialize(obj: object, compress=True, compress_scheme=LZ4, simplified=False)
     # for details on how this works. The general purpose is to handle types
     # which the fast serializer cannot handle
     if not simplified:
-        simple_objects = _simplify(obj)
+        if force_full_simplification:
+            simple_objects = _force_full_simplify(obj)
+        else:
+            simple_objects = _simplify(obj)
     else:
         simple_objects = obj
 
     # 2) Serialize
     # serialize into a binary
-    binary = msgpack.dumps(simple_objects)
+    if force_no_serialization:
+        return simple_objects
+    else:
+        binary = msgpack.dumps(simple_objects)
 
     # 3) Compress
     # optionally compress the binary and return the result
@@ -107,12 +136,13 @@ def serialize(obj: object, compress=True, compress_scheme=LZ4, simplified=False)
     # otherwise we output the compressed stream with header set to '1'
     # even if compressed flag is set to false by the caller we
     # output the input stream as it is with header set to '0'
-    return _compress(binary, compress_scheme, compress)
+    if force_no_compression:
+        return binary
+    else:
+        return _compress(binary)
 
 
-def deserialize(
-    binary: bin, worker: AbstractWorker = None, compressed=True, compress_scheme=LZ4, detail=True
-) -> object:
+def deserialize(binary: bin, worker: AbstractWorker = None, detail=True) -> object:
     """ This method can deserialize any object PySyft needs to send or store.
 
     This is the high level function for deserializing any object or collection
@@ -124,11 +154,6 @@ def deserialize(
         worker (AbstractWorker): the worker which is acquiring the message content,
             for example used to specify the owner of a tensor received(not obvious
             for virtual workers)
-        compressed (bool): whether or not the serialized object is compressed
-            (and thus whether or not it needs to be decompressed).
-        compress_scheme (int): the integer code specifying which compression
-            scheme was used if decompression is needed (see above this method
-            for scheme codes).
         detail (bool): there are some cases where we need to perform the decompression
             and deserialization part, but we don't need to detail all the message.
             This is the case for Plan workers for instance
@@ -140,7 +165,7 @@ def deserialize(
         worker = syft.torch.hook.local_worker
 
     # 1) Decompress the binary if needed
-    binary = _decompress(binary, compress_scheme)
+    binary = _decompress(binary)
 
     # 2) Deserialize
     # This function converts the binary into the appropriate python
@@ -232,74 +257,101 @@ def torch_tensor_deserializer(tensor_bin) -> torch.Tensor:
 # Chosen Compression Algorithm
 
 
-def _compress(decompressed_input_bin: bin, compress_scheme=LZ4, compress=True) -> bin:
+def _apply_compress_scheme(decompressed_input_bin) -> tuple:
     """
-    This function compresses a binary using LZ4
+    Apply the selected compression scheme.
+    By default is used LZ4
+
+    Args:
+        decompressed_input_bin: the binary to be compressed
+    """
+    return apply_lz4_compression(decompressed_input_bin)
+
+
+def apply_lz4_compression(decompressed_input_bin) -> tuple:
+    """
+    Apply LZ4 compression to the input
+
+    Args:
+        :param decompressed_input_bin: the binary to be compressed
+        :return: a tuple (compressed_result, LZ4)
+    """
+    return lz4.frame.compress(decompressed_input_bin), LZ4
+
+
+def apply_zstd_compression(decompressed_input_bin) -> tuple:
+    """
+    Apply ZSTD compression to the input
+
+    Args:
+        :param decompressed_input_bin: the binary to be compressed
+        :return: a tuple (compressed_result, ZSTD)
+    """
+
+    return zstd.compress(decompressed_input_bin), ZSTD
+
+
+def apply_no_compression(decompressed_input_bin) -> tuple:
+    """
+    No compression is applied to the input
+
+    Args:
+        :param decompressed_input_bin: the binary
+        :return: a tuple (the binary, LZ4)
+    """
+
+    return decompressed_input_bin, NO_COMPRESSION
+
+
+def _compress(decompressed_input_bin: bin) -> bin:
+    """
+    This function compresses a binary using the function _apply_compress_scheme
+    if the input has been already compressed in some step, it will return it as it is
 
     Args:
         decompressed_input_bin (bin): binary to be compressed
-        compress_scheme: the compression method to use
-        compress (bool): if the data is already compressed, there is no
-            need to re-compress the input.
 
     Returns:
         bin: a compressed binary
 
     """
 
-    if compress:
+    compress_stream, compress_scheme = _apply_compress_scheme(decompressed_input_bin)
 
-        if compress_scheme == LZ4:
-            compress_stream = lz4.frame.compress(decompressed_input_bin)
-        elif compress_scheme == ZSTD:
-            compress_stream = zstd.compress(decompressed_input_bin)
-        else:
-            raise CompressionNotFoundException(
-                "compression scheme note found for" " compression code:" + str(compress_scheme)
-            )
-
-        if len(compress_stream) < len(decompressed_input_bin):
-            return b"\x31" + compress_stream
-
-    return b"\x30" + decompressed_input_bin
+    if len(compress_stream) < len(decompressed_input_bin):
+        return compress_scheme.to_bytes(1, byteorder="big") + compress_stream
+    else:
+        return NO_COMPRESSION.to_bytes(1, byteorder="big") + decompressed_input_bin
 
 
-def _decompress(binary: bin, compress_scheme=LZ4) -> bin:
+def _decompress(binary: bin) -> bin:
     """
-    This function decompresses a binary using LZ4
+    This function decompresses a binary using the scheme defined in the first byte of the input
 
     Args:
-        compressed_input_bin (bin): a compressed binary
-        compress_scheme: the compression method to use
+        binary (bin): a compressed binary
 
     Returns:
         bin: decompressed binary
 
     """
 
-    # check the 1-byte header to see if input stream was compressed or not
-    if binary[0] == UNUSED_COMPRESSION_INDICATOR:
-        compressed = False
-    else:
-        compressed = True
+    # check the 1-byte header to check the compression scheme used
+    compress_scheme = binary[0]
 
     # remove the 1-byte header from the input stream
     binary = binary[1:]
-
-    # 1)  Decompress
-    # If enabled, this functionality decompresses the binary
-    if compressed:
-
-        if compress_scheme == LZ4:
-            return lz4.frame.decompress(binary)
-        elif compress_scheme == ZSTD:
-            return zstd.decompress(binary)
-        else:
-            raise CompressionNotFoundException(
-                "compression scheme note found for" " compression code:" + str(compress_scheme)
-            )
-
-    return binary
+    # 1)  Decompress or return the original stream
+    if compress_scheme == LZ4:
+        return lz4.frame.decompress(binary)
+    elif compress_scheme == ZSTD:
+        return zstd.decompress(binary)
+    elif compress_scheme == NO_COMPRESSION:
+        return binary
+    else:
+        raise CompressionNotFoundException(
+            "compression scheme not found for" " compression code:" + str(compress_scheme)
+        )
 
 
 # Simplify/Detail Torch Tensors
@@ -390,11 +442,16 @@ def _detail_torch_tensor(worker: AbstractWorker, tensor_tuple: tuple) -> torch.T
 
     if tags is not None:
         for i in range(len(tags)):
-            tags[i] = tags[i].decode("utf-8")
+            tag = tags[i]
+            if isinstance(tag, bytes):
+                tag = tag.decode("utf-8")
+            tags[i] = tag
         tensor.tags = tags
 
     if description is not None:
-        tensor.description = description.decode("utf-8")
+        if isinstance(description, bytes):
+            description = description.decode("utf-8")
+        tensor.description = description
 
     if chain is not None:
         chain = _detail(worker, chain)
@@ -609,10 +666,10 @@ def _simplify_dictionary(my_dict: Dict) -> Dict:
             objects.
 
     """
-    pieces = {}
+    pieces = list()
     # for dictionaries we want to simplify both the key and the value
     for key, value in my_dict.items():
-        pieces[_simplify(key)] = _simplify(value)
+        pieces.append((_simplify(key), _simplify(value)))
 
     return pieces
 
@@ -635,17 +692,18 @@ def _detail_dictionary(worker: AbstractWorker, my_dict: Dict) -> Dict:
     """
     pieces = {}
     # for dictionaries we want to detail both the key and the value
-    for key, value in my_dict.items():
-
+    for key, value in my_dict:
+        detailed_key = _detail(worker, key)
         try:
-            detailed_key = _detail(worker, key).decode("utf-8")
+            detailed_key = detailed_key.decode("utf-8")
         except AttributeError:
-            detailed_key = _detail(worker, key)
+            pass
 
+        detailed_value = _detail(worker, value)
         try:
-            detailed_value = _detail(worker, value).decode("utf-8")
+            detailed_value = detailed_value.decode("utf-8")
         except AttributeError:
-            detailed_value = _detail(worker, value)
+            pass
 
         pieces[detailed_key] = detailed_value
 
@@ -950,6 +1008,90 @@ def _detail_log_tensor(worker: AbstractWorker, tensor_tuple: tuple) -> LoggingTe
     return tensor
 
 
+def _simplify_additive_shared_tensor(tensor: AdditiveSharingTensor) -> tuple:
+    """
+    This function takes the attributes of a AdditiveSharingTensor and saves them in a tuple
+    Args:
+        tensor (AdditiveSharingTensor): a AdditiveSharingTensor
+    Returns:
+        tuple: a tuple holding the unique attributes of the additive shared tensor
+    Examples:
+        data = _simplify_additive_shared_tensor(tensor)
+    """
+
+    chain = None
+    if hasattr(tensor, "child"):
+        chain = _simplify(tensor.child)
+    return (tensor.id, tensor.field, tensor.crypto_provider.id, chain)
+
+
+def _detail_additive_shared_tensor(
+    worker: AbstractWorker, tensor_tuple: tuple
+) -> AdditiveSharingTensor:
+    """
+        This function reconstructs a AdditiveSharingTensor given it's attributes in form of a tuple.
+        Args:
+            worker: the worker doing the deserialization
+            tensor_tuple: a tuple holding the attributes of the AdditiveSharingTensor
+        Returns:
+            AdditiveSharingTensor: a AdditiveSharingTensor
+        Examples:
+            shared_tensor = _detail_additive_shared_tensor(data)
+        """
+
+    tensor_id, field, crypto_provider, chain = tensor_tuple
+
+    tensor = AdditiveSharingTensor(
+        owner=worker, id=tensor_id, field=field, crypto_provider=worker.get_worker(crypto_provider)
+    )
+
+    if chain is not None:
+        chain = _detail(worker, chain)
+        tensor.child = chain
+
+    return tensor
+
+
+def _simplify_multi_pointer_tensor(tensor: MultiPointerTensor) -> tuple:
+    """
+    This function takes the attributes of a MultiPointerTensor and saves them in a tuple
+    Args:
+        tensor (MultiPointerTensor): a MultiPointerTensor
+    Returns:
+        tuple: a tuple holding the unique attributes of the additive shared tensor
+    Examples:
+        data = _simplify_additive_shared_tensor(tensor)
+    """
+
+    chain = None
+    if hasattr(tensor, "child"):
+        chain = _simplify(tensor.child)
+    return (tensor.id, chain)
+
+
+def _detail_multi_pointer_tensor(worker: AbstractWorker, tensor_tuple: tuple) -> MultiPointerTensor:
+    """
+        This function reconstructs a MultiPointerTensor given it's attributes in form of a tuple.
+        Args:
+            worker: the worker doing the deserialization
+            tensor_tuple: a tuple holding the attributes of the MultiPointerTensor
+        Returns:
+            MultiPointerTensor: a MultiPointerTensor
+        Examples:
+            multi_pointer_tensor = _detail_multi_pointer_tensor(data)
+        """
+
+    tensor_id, chain = tensor_tuple
+
+    tensor = MultiPointerTensor(owner=worker, id=tensor_id)
+
+    if chain is not None:
+        chain = _detail(worker, chain)
+        tensor.child = chain
+
+    return tensor
+
+
 def _simplify_plan(plan: Plan) -> tuple:
     """
     This function takes the attributes of a Plan and saves them in a tuple
@@ -959,10 +1101,16 @@ def _simplify_plan(plan: Plan) -> tuple:
         tuple: a tuple holding the unique attributes of the Plan object
 
     """
-
     readable_plan = _simplify(plan.readable_plan)
-
-    return (readable_plan, _simplify(plan.id), _simplify(plan.arg_ids), _simplify(plan.result_ids))
+    return (
+        readable_plan,
+        _simplify(plan.id),
+        _simplify(plan.arg_ids),
+        _simplify(plan.result_ids),
+        plan.name,
+        _simplify(plan.tags),
+        _simplify(plan.description),
+    )
 
 
 def _detail_plan(worker: AbstractWorker, plan_tuple: tuple) -> Plan:
@@ -974,38 +1122,37 @@ def _detail_plan(worker: AbstractWorker, plan_tuple: tuple) -> Plan:
         Plan: a Plan object
     """
 
-    readable_plan, id, arg_ids, result_ids = plan_tuple
-
+    readable_plan, id, arg_ids, result_ids, name, tags, description = plan_tuple
     id = id
     if isinstance(id, bytes):
         id = id.decode("utf-8")
     arg_ids = _detail(worker, arg_ids)
     result_ids = _detail(worker, result_ids)
 
-    plan = syft.Plan(hook=sy.hook, owner=worker, id=id)
-    plan.arg_ids = arg_ids
-    plan.result_ids = result_ids
-
-    plan.readable_plan = _detail(worker, readable_plan)
+    plan = syft.Plan(
+        owner=worker,
+        id=id,
+        arg_ids=arg_ids,
+        result_ids=result_ids,
+        readable_plan=_detail(worker, readable_plan),
+    )
+    if isinstance(name, bytes):
+        plan.name = name.decode("utf-8")
+    plan.tags = _detail(worker, tags)
+    plan.description = _detail(worker, description)
 
     return plan
 
 
-def _simplify_plan_pointer(ptr: PlanPointer) -> tuple:
-    """
-    This function takes the attributes of a PointerTensor and saves them in a dictionary
-    Args:
-        ptr (PointerTensor): a PointerTensor
-    Returns:
-        tuple: a tuple holding the unique attributes of the pointer
-    Examples:
-        data = _simplify_pointer_tensor(ptr)
+def _simplify_worker(worker: AbstractWorker) -> tuple:
     """
 
-    return (ptr.id, ptr.id_at_location, ptr.location.id)
+    """
+
+    return (_simplify(worker.id),)
 
 
-def _detail_plan_pointer(worker: AbstractWorker, plan_pointer_tuple: tuple) -> PointerTensor:
+def _detail_worker(worker: AbstractWorker, worker_tuple: tuple) -> PointerTensor:
     """
     This function reconstructs a PlanPointer given it's attributes in form of a tuple.
 
@@ -1017,26 +1164,63 @@ def _detail_plan_pointer(worker: AbstractWorker, plan_pointer_tuple: tuple) -> P
     Examples:
         ptr = _detail_pointer_tensor(data)
     """
-    # TODO: fix comment for this and simplifier
-    obj_id = plan_pointer_tuple[0]
-    id_at_location = plan_pointer_tuple[1]
-    if isinstance(id_at_location, bytes):
-        id_at_location = id_at_location.decode("utf-8")
-    worker_id = plan_pointer_tuple[2].decode("utf-8")
+    worker_id = _detail(worker, worker_tuple[0])
 
-    # If the pointer received is pointing at the current worker, we load the tensor instead
-    if worker_id == worker.id:
+    referenced_worker = worker.get_worker(worker_id)
 
-        tensor = worker.get_obj(id_at_location)
+    return referenced_worker
 
-        return tensor
-    # Else we keep the same Pointer
-    else:
-        location = syft.torch.hook.local_worker.get_worker(worker_id)
-        ptr = PlanPointer(
-            location=location, id_at_location=id_at_location, owner=worker, id=obj_id, register=True
-        )
-        return ptr
+
+def _simplify_GetNotPermittedError(error: GetNotPermittedError) -> tuple:
+    """Simplifies a GetNotPermittedError into its message"""
+    return (getattr(error, "message", str(error)),)
+
+
+def _detail_GetNotPermittedError(
+    worker: AbstractWorker, error_tuple: tuple
+) -> GetNotPermittedError:
+    """Details and raises a GetNotPermittedError
+
+    Args:
+        worker: the worker doing the deserialization
+        error_tuple: a tuple holding the message of the GetNotPermittedError
+    Raises:
+        GetNotPermittedError: the error thrown when get is not permitted
+    """
+
+    raise GetNotPermittedError(error_tuple[0])
+
+
+def _force_full_simplify_worker(worker: AbstractWorker) -> tuple:
+    """
+
+    """
+
+    return (_simplify(worker.id), _simplify(worker._objects), worker.auto_add)
+
+
+def _force_full_detail_worker(worker: AbstractWorker, worker_tuple: tuple) -> tuple:
+    worker_id, _objects, auto_add = worker_tuple
+    worker_id = _detail(worker, worker_id)
+
+    result = sy.VirtualWorker(sy.hook, worker_id, auto_add=auto_add)
+    _objects = _detail(worker, _objects)
+    result._objects = _objects
+
+    # make sure they weren't accidentally double registered
+    for _, obj in _objects.items():
+        if obj.id in worker._objects:
+            del worker._objects[obj.id]
+
+    return result
+
+
+def _simplify_str(obj: str) -> tuple:
+    return (obj.encode("utf-8"),)
+
+
+def _detail_str(worker: AbstractWorker, str_tuple: tuple) -> str:
+    return str_tuple[0].decode("utf-8")
 
 
 # High Level Simplification Router
@@ -1085,6 +1269,24 @@ def _simplify(obj: object) -> object:
         return obj
 
 
+def _force_full_simplify(obj: object) -> object:
+    current_type = type(obj)
+
+    if current_type in forced_full_simplifiers:
+
+        left = forced_full_simplifiers[current_type][0]
+
+        right = forced_full_simplifiers[current_type][1]
+
+        right = right(obj)
+
+        result = (left, right)
+    else:
+        result = _simplify(obj)
+
+    return result
+
+
 simplifiers = {
     torch.Tensor: [0, _simplify_torch_tensor],
     torch.nn.Parameter: [1, _simplify_torch_parameter],
@@ -1099,9 +1301,15 @@ simplifiers = {
     torch.device: [10, _simplify_torch_device],
     PointerTensor: [11, _simplify_pointer_tensor],
     LoggingTensor: [12, _simplify_log_tensor],
-    Plan: [13, _simplify_plan],
-    PlanPointer: [14, _simplify_plan_pointer],
+    AdditiveSharingTensor: [13, _simplify_additive_shared_tensor],
+    MultiPointerTensor: [14, _simplify_multi_pointer_tensor],
+    Plan: [15, _simplify_plan],
+    VirtualWorker: [16, _simplify_worker],
+    GetNotPermittedError: [17, _simplify_GetNotPermittedError],
+    str: [18, _simplify_str],
 }
+
+forced_full_simplifiers = {VirtualWorker: [19, _force_full_simplify_worker]}
 
 
 def _detail(worker: AbstractWorker, obj: object) -> object:
@@ -1123,7 +1331,7 @@ def _detail(worker: AbstractWorker, obj: object) -> object:
 
     """
 
-    if type(obj) == list:
+    if type(obj) in (list, tuple):
         return detailers[obj[0]](worker, obj[1])
     else:
         return obj
@@ -1143,6 +1351,11 @@ detailers = [
     _detail_torch_device,
     _detail_pointer_tensor,
     _detail_log_tensor,
+    _detail_additive_shared_tensor,
+    _detail_multi_pointer_tensor,
     _detail_plan,
-    _detail_plan_pointer,
+    _detail_worker,
+    _detail_GetNotPermittedError,
+    _detail_str,
+    _force_full_detail_worker,
 ]

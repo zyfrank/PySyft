@@ -4,7 +4,6 @@ import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import random
 
 import syft
 from syft.exceptions import RemoteTensorFoundError
@@ -36,7 +35,7 @@ def test_worker_registration(hook, workers):
 
 
 def test_pointer_found_exception(workers):
-    ptr_id = int(10e10 * random.random())
+    ptr_id = syft.ID_PROVIDER.pop()
     pointer = PointerTensor(id=ptr_id, location=workers["alice"], owner=workers["me"])
 
     try:
@@ -217,7 +216,7 @@ def test_hook_args_and_cmd_signature_malleability():
     assert (r1 == syft.LoggingTensor().on(torch.tensor([2.0, 4]))).all()
 
     r2 = a + 1
-    assert (r2 == syft.LoggingTensor().on(torch.tensor([2.0, 4]))).all()
+    assert (r2 == syft.LoggingTensor().on(torch.tensor([2.0, 3]))).all()
 
     r3 = a + b
     assert (r3 == syft.LoggingTensor().on(torch.tensor([2.0, 4]))).all()
